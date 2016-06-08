@@ -1,0 +1,139 @@
+from airflow import DAG
+from airflow.operators import GenieFullLoadOperator,GenieHiveIncMergeOperator,GenieSqoopOperator,\
+    GenieSqoopBatchOperator,BashOperator, EmrOperator, GenieHiveOperator,GenieSparkOperator, \
+    TimeDeltaSensor,DMStartOperator,DMDoneOperator,BatchStartOperator, BatchEndOperator
+#from airflow.operators import BatchStartOperator,BatchEndOperator
+from datetime import datetime, timedelta
+import batch_common
+from batch_common import BICommon
+
+profile = BICommon().get_profile()
+CDH_queue = profile['AIRFLOW_QUEUE']
+ENV_TAG = profile['ENV'].lower()
+cluster_name = profile['ENV'].lower() + '_' + 'dom_extn_dlvry_status_tracker_full_sqoop_job'
+default_args = batch_common.get_default_arg()
+default_args['start_date'] = datetime(2016, 06, 1)
+default_args['owner'] = profile['JOB_USER']
+default_args['email'] = profile['EMAIL_LIST']
+IMPALA_HOST = profile['IMPALA_HOST']
+default_queue = 'airflow'
+bash_profile_cmd = '. /app/bin/common/prop/.profile;\n '
+SOURCE_DIRECTORY = profile['S3_NIKEBI_MANAGED'] + '/bi/dom/extn_dlvry_status_tracker/'
+TARGET_DIRECTORY = profile['S3_NIKEBI_MANAGED'] + '/bi/dom/extn_dlvry_status_tracker_archive/'
+SCHEMA_NAME = profile['DOM_DB']
+TABLE_NAME = 'EXTN_DELIVERY_STATUS_TRACKER'
+TABLE_NAME_STG = 'STG_EXTN_DELIVERY_STATUS_TRACKER'
+dag = DAG('Sqoop_full_load_dom_extn_dlvry_status_tracker', default_args=default_args, schedule_interval=timedelta(days=1))
+on_failure_cb = EmrOperator(owner='no-owner', task_id='no-task', cluster_action='terminate',
+                            cluster_name=cluster_name).execute
+landing_table = " -f s3://nike-emr-bin/"+ENV_TAG+"/dom/ddl/extn_dlvry_status_tracker.hql -hivevar HIVEDATABASE="+profile['DOM_DB']+" -hivevar S3_NIKEBI_MANAGED="+profile['S3_NIKEBI_MANAGED']+" "
+stage_table = " -f s3://nike-emr-bin/"+ENV_TAG+"/dom/ddl/stg_extn_dlvry_status_tracker.hql -hivevar HIVEDATABASE="+profile['DOM_DB']+" -hivevar S3_NIKEBI_MANAGED="+profile['S3_NIKEBI_MANAGED']+" "
+
+start_time = TimeDeltaSensor(
+    task_id='starting_time',
+    delta=timedelta(hours=04, minutes=11),
+    queue=default_queue,
+    dag=dag)
+
+start = BatchStartOperator (
+        queue=default_queue,
+        dag=dag)
+
+emr_spinup = EmrOperator(
+    task_id='emr_spinup',
+    cluster_action='spinup',
+    cluster_name=cluster_name,
+    # Change to required nodes  after development
+    num_core_nodes=1,
+    num_core_nodes=1,
+    num_task_nodes=1,
+    queue=default_queue,
+    classification='bronze',
+    project_id='FYSHARED-BI',
+    dag=dag)
+
+emr_terminate = EmrOperator(
+    task_id='emr_terminate',
+    cluster_action='terminate',
+    cluster_name=cluster_name,
+    queue=default_queue,
+    dag=dag)
+
+sqoop_load = GenieSqoopBatchOperator(
+    task_id='dom_extn_dlvry_status_tracker',
+    prop_key_path="dom/prop",
+    prop_file="sqoop_AWS_full_import_dom_extn_dlvry_status_tracker.properties",
+    cluster_name=cluster_name,
+    load_type="FULL",
+    sched_type=cluster_name,
+    queue='airflow',
+    dag=dag)
+
+ful_load = GenieFullLoadOperator(
+    task_id='full_load',
+    prop_key_path="dom/prop",
+    prop_file="full_load_dom_extn_dlvry_status_tracker.properties",
+    sched_type=cluster_name,
+    queue='airflow',
+    dag=dag)
+
+# Query Table with Hive
+
+create_landing = GenieHiveOperator(
+    task_id='create_landing',
+    command=landing_table,
+    job_name='create_landing',
+    queue='airflow',
+    sched_type=cluster_name,
+    on_failure_callback=on_failure_cb,
+    dag=dag
+    )
+
+# Query Table with Hive
+
+create_staging = GenieHiveOperator(
+    task_id='create_staging',
+    queue='airflow',
+    sched_type=cluster_name,
+    on_failure_callback=on_failure_cb,
+    dag=dag
+    )
+
+s3_tbl_archive = BashOperator(
+         task_id='s3_tbl_archive',
+         bash_command='  aws s3 sync s3://' + SOURCE_DIRECTORY+' s3://' + TARGET_DIRECTORY + ' --delete',
+         queue='airflow',
+         dag=dag
+         )
+
+repair_table = BashOperator(
+         task_id='repair_tbl',
+         bash_command=". /app/bin/common/prop/.profile; beeline -u \"$BEELINE_CONNECT \" -e  \" USE " + SCHEMA_NAME + " \" "+" -e \"MSCK REPAIR TABLE "+ TABLE_NAME+ " \" "+" -e \"MSCK REPAIR TABLE "+ TABLE_NAME_STG+ "\"",
+         queue=CDH_queue,
+         dag=dag
+         )
+
+impala_refresh = BashOperator(
+         task_id='refresh_tbl',
+         bash_command='. /app/bin/common/prop/.profile; sh /app/bin/common/scripts/impala_refresh_tables.sh '+ SCHEMA_NAME+' '+ TABLE_NAME+'; sh /app/bin/common/scripts/impala_refresh_tables.sh '+ SCHEMA_NAME+' '+ TABLE_NAME_STG,
+         queue=CDH_queue,
+         dag=dag
+         )
+
+
+end = BatchEndOperator(
+    queue=default_queue,
+    dag=dag)
+
+start_time.set_downstream(start)
+start.set_downstream(emr_spinup)
+emr_spinup.set_downstream(create_landing)
+create_landing.set_downstream(create_staging)
+create_staging.set_downstream(sqoop_load)
+sqoop_load.set_downstream(ful_load)
+ful_load.set_downstream(s3_tbl_archive)
+s3_tbl_archive.set_downstream(emr_terminate)
+emr_terminate.set_downstream(repair_table)
+repair_table.set_downstream(impala_refresh)
+impala_refresh.set_downstream(end)
+start_time.set_downstream(end)
