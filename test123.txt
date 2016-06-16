@@ -1,0 +1,11 @@
+1) file landed landing zone
+2) read message from python script
+ 3) key value input parameter -> SH Hive script -> put publisged area processed data 
+                              -> SH Redhift load script -> mv from landing to DB loading
+                                                        -> Load to Redshift
+                                                        -> mv to Archival
+
+
+
+F1 -> f1.1, f1.2,f1.3
+      
